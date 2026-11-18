@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Called from the project's pre-push hook: ship brain edits. Never blocks the push.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Hooks export GIT_DIR and friends for the project; they must not leak into .brain.
+unset $(git rev-parse --local-env-vars 2>/dev/null)
+export GIT_TERMINAL_PROMPT=0
+GIT_SSH_COMMAND="$(git -C "$here/.." config core.sshCommand || echo ssh) -o BatchMode=yes -o ConnectTimeout=10"
+export GIT_SSH_COMMAND
+branch=$(git -C "$here/../.." rev-parse --abbrev-ref HEAD 2>/dev/null)
+"$here/brain" sync "$branch" </dev/null || true
+exit 0

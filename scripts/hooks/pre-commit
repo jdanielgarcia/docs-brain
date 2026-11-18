@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The brain's own pre-commit: built graph files are committed only by /absorb (ABSORB=1).
+[ "${ABSORB:-}" = 1 ] && exit 0
+root="$(git rev-parse --show-toplevel)"
+# shellcheck disable=SC2046
+bad=$(git diff --cached --name-only -- $("$root/scripts/brain" graph-files))
+[ -z "$bad" ] && exit 0
+echo "brain: built graph files are committed only by /absorb (ABSORB=1):" >&2
+echo "$bad" | sed 's/^/  /' >&2
+echo "Unstage them with: git restore --staged $(echo "$bad" | tr '\n' ' ')" >&2
+exit 1

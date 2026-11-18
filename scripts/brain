@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# brain: CLI for the project memory that lives in <project>/.brain
+set -euo pipefail
+
+BRAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PROJECT="$(dirname "$BRAIN")"
+# Built graph files. graphify writes them; only /absorb commits them (ABSORB=1).
+BUILT_GRAPH=(graph.json graph.html GRAPH_REPORT.md GRAPH_REPORT.html manifest.json cost.json .graphify_labels.json)
+
+MAIN_BRANCH="" TEMPLATE_REMOTE="" CLAIM_TTL_DAYS=7
+# shellcheck source=../brain.conf
+[ -f "$BRAIN/brain.conf" ] && . "$BRAIN/brain.conf"
+export GIT_TERMINAL_PROMPT=0
+
+g() { git -C "$BRAIN" "$@"; }
+die() { echo "brain: $*" >&2; exit 1; }
+built_paths() { local f; for f in "${BUILT_GRAPH[@]}"; do echo "graphify-out/$f"; done; }
+
+need_id() {
+  HANDLE=$(g config brain.handle || true)
+  INITIALS=$(g config brain.initials || true)
+  [ -n "$HANDLE" ] && [ -n "$INITIALS" ] || die "no identity: run .brain/scripts/setup.sh"
+}
+
+main_branch() {
+  local b
+  if [ -n "$MAIN_BRANCH" ]; then echo "$MAIN_BRANCH"; return; fi
+  if b=$(git -C "$PROJECT" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); then
+    echo "${b#origin/}"
+  else
+    echo main
+  fi
+}
+
+upstream() {
+  g rev-parse -q --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null \
+    || echo "origin/$(g symbolic-ref --short HEAD)"
+}
+
+# Claim files: "key: value" lines (holder, date, epoch, branch, topic).
+field() { sed -n "s/^$1: //p" "$2" | head -1; }
+claim_live() {
+  local e; e=$(field epoch "$1")
+  [ -n "$e" ] && [ $(( $(date +%s) - e )) -lt $(( CLAIM_TTL_DAYS * 86400 )) ]
+}
+
+# Upstream rewrote the built graph since we diverged: drop our local build so the
+# rebase/fast-forward can take theirs. A local build is cheap to redo.
+take_upstream_graph() {
+  local up=$1 p
+  g diff --quiet "HEAD...$up" -- $(built_paths) && return 0
+  for p in $(built_paths); do
+    if g cat-file -e "HEAD:$p" 2>/dev/null; then g checkout -q HEAD -- "$p"; else rm -f "${BRAIN:?}/$p"; fi
+  done
+}
+
+# fetch + take upstream graph + rebase local commits on top. Fails if offline or on conflict.
+update_from_upstream() {
+  local up; up=$(upstream)
+  g fetch -q origin || return 2
+  take_upstream_graph "$up"
+  if ! g rebase -q --autostash "$up" >/dev/null 2>&1; then
+    g rebase --abort >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+cmd_lookup() {
+  [ $# -gt 0 ] || die "usage: brain lookup <keywords...>"
+  local f k n stem who title
+  echo "## ADRs"
+  for f in "$BRAIN"/adr/*.md; do
+    [ -e "$f" ] || continue
+    n=0
+    for k in "$@"; do grep -qiF -- "$k" "$f" && n=$((n + 1)); done
+    [ "$n" -gt 0 ] || continue
+    stem=$(basename "$f" .md)
+    who=$(grep -m1 -i 'initiated by' "$f" | grep -oE '@[A-Za-z0-9_-]+' | head -1 || true)
+    title=$(grep -m1 '^# ' "$f" | sed 's/^# //' || true)
+    printf '%s\t%s  %s  %s\n' "$n" "$stem" "${who:-@?}" "$title"
+  done | sort -t "$(printf '\t')" -k1,1nr -k2,2 | awk 'NR <= 15' | cut -f2-
+  echo
+  echo "## Glossary"
+  [ -f "$BRAIN/CONTEXT.md" ] && awk -v kw="$*" '
+    BEGIN { n = split(tolower(kw), K, " ") }
+    { l = $0
+      while (match(l, /\*\*[^*]+\*\*/)) {
+        t = tolower(substr(l, RSTART, RLENGTH))
+        for (i = 1; i <= n; i++) if (index(t, K[i])) { print NR ": " $0; next }
+        l = substr(l, RSTART + RLENGTH)
+      } }' "$BRAIN/CONTEXT.md"
+  echo
+  echo "## Live claims"
+  for f in "$BRAIN"/claims/*.md; do
+    [ -e "$f" ] && claim_live "$f" || continue
+    for k in "$@"; do
+      if { basename "$f"; cat "$f"; } | grep -iF -- "$k" >/dev/null; then
+        echo "$(basename "$f" .md)  $(field holder "$f")  since $(field date "$f")  $(field topic "$f")"
+        break
+      fi
+    done
+  done
+}
+
+write_claim() {
+  local branch
+  branch=$(git -C "$PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+  printf 'holder: @%s\ndate: %s\nepoch: %s\nbranch: %s\ntopic: %s\n' \
+    "$HANDLE" "$(date +%F)" "$(date +%s)" "$branch" "$2" > "$BRAIN/claims/$1.md"
+}
+
+cmd_claim() {
+  need_id
+  [ $# -ge 2 ] || die "usage: brain claim <slug> <topic...>"
+  local slug=$1 f h try rc; shift
+  case $slug in *[!a-z0-9-]*|"") die "slug must be lowercase letters, digits and dashes" ;; esac
+  f="$BRAIN/claims/$slug.md"
+  update_from_upstream || die "can't reach the brain remote (or local brain has a conflict); not claiming"
+  if [ -f "$f" ] && claim_live "$f"; then
+    h=$(field holder "$f")
+    [ "$h" = "@$HANDLE" ] || die "'$slug' is claimed by $h since $(field date "$f")"
+  fi
+  write_claim "$slug" "$*"
+  g add -- "claims/$slug.md"
+  g commit -q -m "claim: $slug by @$HANDLE" -- "claims/$slug.md"
+  for try in 1 2; do
+    g push -q origin HEAD 2>/dev/null && { echo "claimed $slug"; return 0; }
+    rc=0; update_from_upstream || rc=$?
+    [ "$rc" = 2 ] && die "push failed and the remote is unreachable; claim is only local"
+    if [ "$rc" != 0 ]; then
+      # Someone pushed the same claim file first. Undo ours and name them.
+      g reset -q HEAD~1
+      g checkout -q -- "claims/$slug.md" 2>/dev/null || rm -f "$f"
+      die "'$slug' was just claimed by $(g show "$(upstream):claims/$slug.md" 2>/dev/null | sed -n 's/^holder: //p')"
+    fi
+  done
+  die "claim committed locally but push failed; run brain sync"
+}
+
+cmd_release() {
+  [ $# -eq 1 ] || die "usage: brain release <slug>"
+  [ -f "$BRAIN/claims/$1.md" ] || die "no claim named '$1'"
+  g rm -q -- "claims/$1.md"
+  echo "released $1 (ships with the next sync)"
+}
+
+cmd_next() {
+  local m=0 f n
+  for f in "$BRAIN"/adr/[0-9][0-9][0-9][0-9]-*.md; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f"); n=$((10#${n:0:4}))
+    [ "$n" -gt "$m" ] && m=$n
+  done
+  printf '%04d\n' $((m + 1))
+}
+
+cmd_next_sub() {
+  [ $# -eq 1 ] && [[ $1 =~ ^[0-9]{4}$ ]] || die "usage: brain next-sub <NNNN>"
+  local p=$1 m=0 f n
+  compgen -G "$BRAIN/adr/$p-*.md" >/dev/null || die "no top-level ADR $p"
+  for f in "$BRAIN/adr/$p".[0-9]*-*.md; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f"); n=${n#"$p".}; n=${n%%-*}; n=$((10#$n))
+    [ "$n" -gt "$m" ] && m=$n
+  done
+  echo "$p.$((m + 1))"
+}
+
+# Replace ADR number $2 with $3 in the first $4 lines of file $1 (whole numbers only).
+renum_text() {
+  local o=${2//./\\.}
+  sed -E -i.bak "1,$4s/(^|[^0-9.])$o([^0-9.]|\\.[^0-9]|\\.?\$)/\\1$3\\2/g" "$1" && rm -f "$1.bak"
+}
+
+# After rebasing, move ADRs this sync adds whose number upstream already used.
+fix_collisions() {
+  local up=$1 f b num rest new p sub newp who parent moved="" changed=0
+  for f in $(g diff --name-only --diff-filter=A "$up..HEAD" -- adr | grep -E '^adr/[0-9]{4}-' || true); do
+    b=$(basename "$f"); num=${b:0:4}; rest=${b:5}
+    [ "$(compgen -G "$BRAIN/adr/$num-*.md" | wc -l)" -gt 1 ] || continue
+    new=$(cmd_next)
+    g mv "$f" "adr/$new-$rest"
+    renum_text "$BRAIN/adr/$new-$rest" "$num" "$new" 8
+    g add -- "adr/$new-$rest"
+    moved="$moved $num:$new"; changed=1
+    echo "brain: renumbered $num-$rest -> $new-$rest"
+  done
+  for f in $(g diff --name-only --diff-filter=A "$up..HEAD" -- adr | grep -E '^adr/[0-9]{4}\.[0-9]+-' || true); do
+    b=$(basename "$f"); num=${b%%-*}; p=${num%%.*}; rest=${b#*-}
+    newp=$p
+    for m in $moved; do [ "${m%%:*}" = "$p" ] && newp=${m#*:}; done
+    if [ "$newp" = "$p" ] && [ "$(compgen -G "$BRAIN/adr/$num-*.md" | wc -l)" -le 1 ]; then continue; fi
+    sub=$(cmd_next_sub "$newp")
+    g mv "$f" "adr/$sub-$rest"
+    renum_text "$BRAIN/adr/$sub-$rest" "$num" "$sub" 8
+    [ "$newp" != "$p" ] && renum_text "$BRAIN/adr/$sub-$rest" "$p" "$newp" 8
+    who=$(grep -m1 -i 'initiated by' "$BRAIN/adr/$sub-$rest" | grep -oE '@[A-Za-z0-9_-]+' | head -1 || true)
+    parent=$(compgen -G "$BRAIN/adr/$newp-*.md" | head -1)
+    # Rewrite this author's Revisions line for the old number in the parent.
+    awk -v old="- $num " -v new="- $sub " -v who="$who" '
+      /^## Revisions/ { r = 1 }
+      r && !done && index($0, old) == 1 && (who == "" || index($0, who)) { $0 = new substr($0, length(old) + 1); done = 1 }
+      { print }' "$parent" > "$parent.tmp" && mv "$parent.tmp" "$parent"
+    g add -- "$parent" "adr/$sub-$rest"
+    changed=1
+    echo "brain: renumbered $num-$rest -> $sub-$rest"
+  done
+  [ "$changed" = 1 ] && g commit -q -m "docs(adr): renumber colliding ADRs"
+  return 0
+}
+
+cmd_sync() {
+  need_id
+  set +e
+  local branch=${1:-} up stems ahead
+  [ -n "$branch" ] || branch=$(git -C "$PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+  if [ -d "$(g rev-parse --git-path rebase-merge)" ] || [ -d "$(g rev-parse --git-path rebase-apply)" ]; then
+    echo "brain: a rebase is in progress in .brain; finish it (git -C .brain rebase --continue), then run .brain/scripts/brain sync"
+    return 0
+  fi
+  g add -A -- adr CONTEXT.md claims graphify-out
+  g reset -q -- $(built_paths) >/dev/null 2>&1
+  if ! g diff --cached --quiet; then
+    stems=$(g diff --cached --name-only | sed 's#.*/##; s/\.[^.]*$//' | head -5 | paste -sd, - | sed 's/,/, /g')
+    g commit -q -m "docs(adr): $stems from $branch by @$HANDLE" || { echo "brain: commit failed"; return 0; }
+  fi
+  up=$(upstream)
+  if ! g fetch -q origin 2>/dev/null; then
+    [ "$(g rev-list --count "$up..HEAD" 2>/dev/null)" != 0 ] && echo "brain: committed locally, will push next time"
+    return 0
+  fi
+  take_upstream_graph "$up"
+  ahead=$(g rev-list --count "$up..HEAD")
+  if [ "$ahead" = 0 ]; then
+    g merge -q --ff-only "$up" >/dev/null 2>&1 || echo "brain: couldn't fast-forward .brain; local edits overlap upstream"
+    return 0
+  fi
+  if ! g rebase -q --autostash "$up" >/dev/null 2>&1; then
+    g rebase --abort >/dev/null 2>&1
+    echo "brain: conflict with upstream; run 'git -C .brain pull --rebase', resolve, then .brain/scripts/brain sync"
+    return 0
+  fi
+  fix_collisions "$up"
+  g push -q origin HEAD 2>/dev/null || echo "brain: push failed, will retry on next sync"
+  return 0
+}
+
+cmd_pull() {
+  set +e
+  local up; up=$(upstream)
+  g fetch -q origin 2>/dev/null || return 0
+  take_upstream_graph "$up"
+  g merge -q --ff-only "$up" >/dev/null 2>&1
+  return 0
+}
+
+cmd_upgrade() {
+  [ -n "$TEMPLATE_REMOTE" ] || die "set TEMPLATE_REMOTE in .brain/brain.conf"
+  g fetch -q "$TEMPLATE_REMOTE" HEAD || die "can't fetch $TEMPLATE_REMOTE"
+  g checkout FETCH_HEAD -- scripts skills CLAUDE.snippet.md
+  g diff --stat HEAD -- scripts skills CLAUDE.snippet.md
+  echo "Review, then commit in .brain. Re-run .brain/scripts/setup.sh if skills were added."
+}
+
+usage() {
+  cat <<'EOF'
+usage: .brain/scripts/brain <command>
+  lookup <keywords...>    ADRs, glossary terms and live claims that match
+  claim <slug> <topic...> claim a topic before writing about it (pushes now)
+  release <slug>          drop your claim (ships with the next sync)
+  next                    next free top-level ADR number
+  next-sub <NNNN>         next free sub-ADR number under NNNN
+  me                      your handle and initials
+  sync [project-branch]   commit brain edits, rebase, fix ADR numbers, push
+  pull                    fast-forward the brain, preferring upstream's graph
+  upgrade                 pull scripts/ and skills/ from TEMPLATE_REMOTE
+  main-branch             the project's main branch
+  graph-files             the built graph files (only /absorb commits them)
+EOF
+}
+
+main() {
+  local c=${1:-}; [ $# -gt 0 ] && shift
+  case $c in
+    lookup) cmd_lookup "$@" ;;
+    claim) cmd_claim "$@" ;;
+    release) cmd_release "$@" ;;
+    next) cmd_next ;;
+    next-sub) cmd_next_sub "$@" ;;
+    me) need_id; echo "@$HANDLE ($INITIALS)" ;;
+    sync) cmd_sync "$@" ;;
+    pull) cmd_pull ;;
+    upgrade) cmd_upgrade ;;
+    main-branch) main_branch ;;
+    graph-files) built_paths ;;
+    *) usage; [ -z "$c" ] || exit 1 ;;
+  esac
+}
+
+# Whole-line call so `brain upgrade` can replace this file while it runs.
+main "$@"; exit $?

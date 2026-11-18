@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Called from the project's post-merge and post-rewrite hooks: fast-forward the brain.
+# Silent, never blocks.
+[ "${1:-}" = amend ] && exit 0
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+unset $(git rev-parse --local-env-vars 2>/dev/null)
+export GIT_TERMINAL_PROMPT=0
+GIT_SSH_COMMAND="$(git -C "$here/.." config core.sshCommand || echo ssh) -o BatchMode=yes -o ConnectTimeout=10"
+export GIT_SSH_COMMAND
+"$here/brain" pull </dev/null >/dev/null 2>&1
+exit 0
